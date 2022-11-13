@@ -14,10 +14,12 @@ import com.github.tvbox.osc.bean.LiveChannelItem;
 import com.github.tvbox.osc.bean.ParseBean;
 import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.server.ControlManager;
+import com.github.tvbox.osc.util.AES;
 import com.github.tvbox.osc.util.AdBlocker;
 import com.github.tvbox.osc.util.DefaultConfig;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.MD5;
+import com.github.tvbox.osc.util.VideoParseRuler;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -40,6 +42,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import com.undcover.freedom.pyramid.PythonLoader;
+import com.github.catvod.crawler.SpiderNull;
+
 /**
  * @author pj567
  * @date :2020/12/18
@@ -55,11 +60,15 @@ public class ApiConfig {
     private List<String> vipParseFlags;
     private List<IJKCode> ijkCodes;
     private String spider = null;
+    public String wallpaper = "";
 
     private SourceBean emptyHome = new SourceBean();
 
     private JarLoader jarLoader = new JarLoader();
 
+    private String userAgent = "okhttp/3.15";
+
+    private String requestAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9";
 
     private ApiConfig() {
         sourceBeanList = new LinkedHashMap<>();
@@ -78,6 +87,32 @@ public class ApiConfig {
         return instance;
     }
 
+    public static String FindResult(String json, String configKey) {
+        String content = json;
+        try {
+            if (AES.isJson(content)) return content;
+            if(content.contains("**")){
+                String[] data = json.split("\\*\\*");
+                content = new String(Base64.decode(data[1], Base64.DEFAULT));
+            }
+            if (content.startsWith("2423")) {
+                String data = content.substring(content.indexOf("2324") + 4, content.length() - 26);
+                content = new String(AES.toBytes(content)).toLowerCase();
+                String key = AES.rightPadding(content.substring(content.indexOf("$#") + 2, content.indexOf("#$")), "0", 16);
+                String iv = AES.rightPadding(content.substring(content.length() - 13), "0", 16);
+                json = AES.CBC(data, key, iv);
+            }else if (configKey !=null && !AES.isJson(content)) {
+                json = AES.ECB(content, configKey);
+            }
+            else{
+                json = content;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return json;
+    }
+
     public void loadConfig(boolean useCache, LoadConfigCallback callback, Activity activity) {
         String apiUrl = Hawk.get(HawkConfig.API_URL, "");
         if (apiUrl.isEmpty()) {
@@ -94,17 +129,35 @@ public class ApiConfig {
                 th.printStackTrace();
             }
         }
-        String apiFix = apiUrl;
-        if (apiUrl.startsWith("clan://")) {
-            apiFix = clanToAddress(apiUrl);
+        String TempKey = null, configUrl = "", pk = ";pk;";
+        if (apiUrl.contains(pk)) {
+            String[] a = apiUrl.split(pk);
+            TempKey = a[1];
+            if (apiUrl.startsWith("clan")){
+                configUrl = clanToAddress(a[0]);
+            }else if (apiUrl.startsWith("http")){
+                configUrl = a[0];
+            }else {
+                configUrl = "http://" + a[0];
+            }
+        } else if (apiUrl.startsWith("clan")) {
+            configUrl = clanToAddress(apiUrl);
+        } else if (!apiUrl.startsWith("http")) {
+            configUrl = "http://" + configUrl;
+        } else {
+            configUrl = apiUrl;
         }
-        OkGo.<String>get(apiFix)
+        String configKey = TempKey;
+        OkGo.<String>get(configUrl)
+                .headers("User-Agent", userAgent)
+                .headers("Accept", requestAccept)
                 .execute(new AbsCallback<String>() {
                     @Override
                     public void onSuccess(Response<String> response) {
                         try {
                             String json = response.body();
-                            parseJson(apiUrl, response.body());
+                            json = FindResult(json, configKey);
+                            parseJson(apiUrl, json);
                             try {
                                 File cacheDir = cache.getParentFile();
                                 if (!cacheDir.exists())
@@ -150,6 +203,8 @@ public class ApiConfig {
                         if (apiUrl.startsWith("clan")) {
                             result = clanContentFix(clanToAddress(apiUrl), result);
                         }
+                        //假相對路徑
+                        result = fixContentPath(apiUrl,result);
                         return result;
                     }
                 });
@@ -173,7 +228,10 @@ public class ApiConfig {
             }
         }
 
-        OkGo.<File>get(jarUrl).execute(new AbsCallback<File>() {
+        OkGo.<File>get(jarUrl)
+                .headers("User-Agent", userAgent)
+                .headers("Accept", requestAccept)
+                .execute(new AbsCallback<File>() {
 
             @Override
             public File convertResponse(okhttp3.Response response) throws Throwable {
@@ -223,9 +281,14 @@ public class ApiConfig {
     }
 
     private void parseJson(String apiUrl, String jsonStr) {
+        // pyramid
+        PythonLoader.getInstance().setConfig(jsonStr);
+
         JsonObject infoJson = new Gson().fromJson(jsonStr, JsonObject.class);
         // spider
         spider = DefaultConfig.safeJsonString(infoJson, "spider", "");
+        // wallpaper
+        wallpaper = DefaultConfig.safeJsonString(infoJson, "wallpaper", "");
         // 远端站点源
         SourceBean firstSite = null;
         for (JsonElement opt : infoJson.get("sites").getAsJsonArray()) {
@@ -240,8 +303,15 @@ public class ApiConfig {
             sb.setQuickSearch(DefaultConfig.safeJsonInt(obj, "quickSearch", 1));
             sb.setFilterable(DefaultConfig.safeJsonInt(obj, "filterable", 1));
             sb.setPlayerUrl(DefaultConfig.safeJsonString(obj, "playUrl", ""));
-            sb.setExt(DefaultConfig.safeJsonString(obj, "ext", ""));
+            if(obj.has("ext") && (obj.get("ext").isJsonArray() || obj.get("ext").isJsonObject())){
+                sb.setExt(obj.get("ext").toString());
+            }else {
+                sb.setExt(DefaultConfig.safeJsonString(obj, "ext", ""));
+            }
+            sb.setJar(DefaultConfig.safeJsonString(obj, "jar", ""));
+            sb.setPlayerType(DefaultConfig.safeJsonInt(obj, "playerType", -1));
             sb.setCategories(DefaultConfig.safeJsonStringList(obj, "categories"));
+            sb.setClickSelector(DefaultConfig.safeJsonString(obj, "click", ""));
             if (firstSite == null)
                 firstSite = sb;
             sourceBeanList.put(siteKey, sb);
@@ -257,6 +327,7 @@ public class ApiConfig {
         // 需要使用vip解析的flag
         vipParseFlags = DefaultConfig.safeJsonStringList(infoJson, "flags");
         // 解析地址
+        parseBeanList.clear();
         for (JsonElement opt : infoJson.get("parses").getAsJsonArray()) {
             JsonObject obj = (JsonObject) opt;
             ParseBean pb = new ParseBean();
@@ -291,13 +362,20 @@ public class ApiConfig {
                 //clan
                 String extUrl = Uri.parse(url).getQueryParameter("ext");
                 if (extUrl != null && !extUrl.isEmpty()) {
-                    String extUrlFix = new String(Base64.decode(extUrl, Base64.DEFAULT | Base64.URL_SAFE | Base64.NO_WRAP), "UTF-8");
+                    String extUrlFix;
+                    if(extUrl.startsWith("http") || extUrl.startsWith("clan://")){
+                        extUrlFix = extUrl;
+                    }else {
+                        extUrlFix = new String(Base64.decode(extUrl, Base64.DEFAULT | Base64.URL_SAFE | Base64.NO_WRAP), "UTF-8");
+                    }
+//                    System.out.println("extUrlFix :"+extUrlFix);
                     if (extUrlFix.startsWith("clan://")) {
                         extUrlFix = clanContentFix(clanToAddress(apiUrl), extUrlFix);
-                        extUrlFix = Base64.encodeToString(extUrlFix.getBytes("UTF-8"), Base64.DEFAULT | Base64.URL_SAFE | Base64.NO_WRAP);
-                        url = url.replace(extUrl, extUrlFix);
                     }
+                    extUrlFix = Base64.encodeToString(extUrlFix.getBytes("UTF-8"), Base64.DEFAULT | Base64.URL_SAFE | Base64.NO_WRAP);
+                    url = url.replace(extUrl, extUrlFix);
                 }
+//                System.out.println("url :"+url);
                 LiveChannelGroup liveChannelGroup = new LiveChannelGroup();
                 liveChannelGroup.setGroupName(url);
                 liveChannelGroupList.add(liveChannelGroup);
@@ -306,6 +384,20 @@ public class ApiConfig {
             }
         } catch (Throwable th) {
             th.printStackTrace();
+        }
+        //video parse rule for host
+        if (infoJson.has("rules")) {
+            for(JsonElement oneHostRule : infoJson.getAsJsonArray("rules")) {
+                JsonObject obj = (JsonObject) oneHostRule;
+                String host = obj.get("host").getAsString();
+                JsonArray ruleJsonArr = obj.getAsJsonArray("rule");
+                ArrayList<String> rule = new ArrayList<>();
+                for(JsonElement one : ruleJsonArr) {
+                    String oneRule = one.getAsString();
+                    rule.add(oneRule);
+                }
+                VideoParseRuler.addHostRule(host, rule);
+            }
         }
         // 广告地址
         for (JsonElement host : infoJson.getAsJsonArray("ads")) {
@@ -391,10 +483,35 @@ public class ApiConfig {
     }
 
     public Spider getCSP(SourceBean sourceBean) {
-        return jarLoader.getSpider(sourceBean.getKey(), sourceBean.getApi(), sourceBean.getExt());
+        // Getting Pyramid api
+        if (sourceBean.getApi().startsWith("py_")) {
+            try {
+                return PythonLoader.getInstance().getSpider(sourceBean.getKey(), sourceBean.getExt());
+            } catch (Exception e) {
+                e.printStackTrace();
+                return new SpiderNull();
+            }
+        }
+        return jarLoader.getSpider(sourceBean.getKey(), sourceBean.getApi(), sourceBean.getExt(), sourceBean.getJar());
     }
 
     public Object[] proxyLocal(Map param) {
+        // Getting pyramid api
+        try {
+            if (param.containsKey("api")) {
+                String doStr = param.get("do").toString();
+                if (doStr.equals("ck"))
+                    return PythonLoader.getInstance().proxyLocal("", "", param);
+                SourceBean sourceBean = ApiConfig.get().getSource(doStr);
+                return PythonLoader.getInstance().proxyLocal(sourceBean.getKey(), sourceBean.getExt(), param);
+            } else {
+                String doStr = param.get("do").toString();
+                if (doStr.equals("live"))
+                    return PythonLoader.getInstance().proxyLocal("", "", param);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
         return jarLoader.proxyInvoke(param);
     }
 
@@ -493,5 +610,16 @@ public class ApiConfig {
     String clanContentFix(String lanLink, String content) {
         String fix = lanLink.substring(0, lanLink.indexOf("/file/") + 6);
         return content.replace("clan://", fix);
+    }
+
+    String fixContentPath(String url, String content) {
+        if (content.contains("\"./")) {
+            if(!url.startsWith("http") && !url.startsWith("clan://")){
+                url = "http://" + url;
+            }
+            if(url.startsWith("clan://"))url=clanToAddress(url);
+            content = content.replace("./", url.substring(0,url.lastIndexOf("/") + 1));
+        }
+        return content;
     }
 }
